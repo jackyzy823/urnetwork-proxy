@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -11,7 +12,6 @@ import (
 	"slices"
 	"strings"
 	"time"
-	"flag"
 
 	gojwt "github.com/golang-jwt/jwt/v5"
 	"github.com/samber/lo"
@@ -35,6 +35,7 @@ func initGlog() {
 	flag.Set("alsologtostderr", "true")
 	flag.Set("stderrthreshold", "INFO")
 	flag.Set("v", "0")
+	// flag.Set("v", "2") // verbose
 	// unlike unix, the android/ios standard is for diagnostics to go to stdout
 	os.Stderr = os.Stdout
 }
@@ -46,6 +47,7 @@ func main() {
 		platformURL string
 		userAuth    string
 		password    string
+		authJwt     string
 		providerID  string
 		city        string
 		country     string
@@ -79,14 +81,18 @@ func main() {
 				Usage:       "User auth",
 				EnvVars:     []string{"USER_AUTH"},
 				Destination: &cfg.userAuth,
-				Required:    true,
 			},
 			&cli.StringFlag{
 				Name:        "password",
 				Usage:       "Password",
 				EnvVars:     []string{"PASSWORD"},
 				Destination: &cfg.password,
-				Required:    true,
+			},
+			&cli.StringFlag{
+				Name:        "authjwt",
+				Usage:       "AuthJWT",
+				EnvVars:     []string{"AUTHJWT"},
+				Destination: &cfg.authJwt,
 			},
 			&cli.StringFlag{
 				Name:        "provider-id",
@@ -115,12 +121,33 @@ func main() {
 		},
 		Name: "socksproxy",
 		Action: func(c *cli.Context) error {
-
 			ctx := c.Context
+			var jwt string
+			var err error
+			if cfg.authJwt != "" {
+				jwt = cfg.authJwt
+			} else if cfg.password != "" && cfg.userAuth != "" {
+				jwt, err = login(ctx, cfg.apiURL, cfg.userAuth, cfg.password)
+				if err != nil {
+					return fmt.Errorf("login failed: %w", err)
+				}
+			} else {
+				return fmt.Errorf("Either use AuthJWT or use user auth + password\n")
+			}
 
-			jwt, err := login(ctx, cfg.apiURL, cfg.userAuth, cfg.password)
+			// [TODO] regularly check balance?
+			res, err := subscriptionBalance(ctx, cfg.apiURL, jwt)
 			if err != nil {
-				return fmt.Errorf("login failed: %w", err)
+				return fmt.Errorf("Get subscription balance failed %w", err)
+			} else {
+				fmt.Printf("Subscription: %+v\n", res)
+				fmt.Printf("Available: %d MB\nUsed: %d MB\nPending: %d MB \nTotal: %d MB\n",
+					res.BalanceByteCount/1024.0/1024.0,
+					(res.StartBalanceByteCount-res.BalanceByteCount-res.OpenTransferByteCount)/1024.0/1024.0,
+					res.OpenTransferByteCount/1024.0/1024.0,
+					res.StartBalanceByteCount/1024.0/1024.0,
+				)
+
 			}
 
 			locations, err := getProviderLocations(
@@ -143,18 +170,26 @@ func main() {
 				return fmt.Errorf("get provider spec failed: %w", err)
 			}
 
-			clientJWT, err := authNetworkClient(
-				ctx,
-				cfg.apiURL,
-				jwt,
-				&connect.AuthNetworkClientArgs{
-					Description: "my device",
-					DeviceSpec:  "socks5",
-				},
-			)
-
-			if err != nil {
-				return fmt.Errorf("auth network client failed: %w", err)
+			// if jwt already is client jwt (contains clientid), we don't need to fetch new one.
+			// TODO and we shoud refresh it
+			// So in connectl , we should generate jwt and also client jwt
+			var clientJWT string
+			if _, err := parseByJwtClientId(jwt); err == nil {
+				fmt.Println("JWT from arguments already is clientJWT")
+				clientJWT = jwt
+			} else {
+				clientJWT, err = authNetworkClient(
+					ctx,
+					cfg.apiURL,
+					jwt,
+					&connect.AuthNetworkClientArgs{
+						Description: "my device",
+						DeviceSpec:  "socks5",
+					},
+				)
+				if err != nil {
+					return fmt.Errorf("auth network client failed: %w", err)
+				}
 			}
 
 			clientID, err := parseByJwtClientId(clientJWT)
@@ -163,6 +198,20 @@ func main() {
 			}
 
 			fmt.Println("my clientID:", clientID)
+			fmt.Println("my clientjwt:", clientJWT)
+
+			// refresh client jwt???
+
+			// refreshjwt, err := refreshJwt(ctx, cfg.apiURL, clientJWT)
+			// if err != nil {
+			// 	return fmt.Errorf("Refresh JWT failed %w", err)
+			// } else {
+			// 	if refreshjwt.Error != nil {
+			// 		fmt.Printf("New jwt %s\n", refreshjwt.Error.Message)
+			// 	} else {
+			// 		fmt.Printf("New jwt %s\n", refreshjwt.ByJwt)
+			// 	}
+			// }
 
 			generator := connect.NewApiMultiClientGenerator(
 				ctx,
@@ -407,6 +456,80 @@ func login(ctx context.Context, apiURL, userAuth, password string) (string, erro
 	}
 
 	return res.res.Network.ByJwt, nil
+
+}
+
+// Copied from sdk/api.go
+type ByteCount = int64
+type NanoCents = int64
+type Subscription struct {
+	SubscriptionId string `json:"subscription_id"`
+	Store          string `json:"store"`
+	Plan           string `json:"plan"`
+}
+type TransferBalance struct {
+	BalanceId             string    `json:"balance_id"`
+	NetworkId             string    `json:"network_id"`
+	StartTime             string    `json:"start_time"`
+	EndTime               string    `json:"end_time"`
+	StartBalanceByteCount ByteCount `json:"start_balance_byte_count"`
+	// how much money the platform made after subtracting fees
+	NetRevenue       NanoCents `json:"net_revenue"`
+	BalanceByteCount ByteCount `json:"balance_byte_count"`
+}
+
+type SubscriptionBalanceResult struct {
+	/*
+	 * StartBalanceByteCount - The available balance the user starts the day with
+	 */
+	StartBalanceByteCount ByteCount `json:"start_balance_byte_count"`
+	/**
+	 * BalanceByteCount - The remaining balance the user has available
+	 */
+	BalanceByteCount ByteCount `json:"balance_byte_count"`
+	/**
+	 * OpenTransferByteCount - The total number of bytes tied up in open transfers
+	 */
+	OpenTransferByteCount     ByteCount          `json:"open_transfer_byte_count"`
+	CurrentSubscription       *Subscription      `json:"current_subscription,omitempty"`
+	ActiveTransferBalances    *[]TransferBalance `json:"active_transfer_balances,omitempty"`
+	PendingPayoutUsdNanoCents NanoCents          `json:"pending_payout_usd_nano_cents"`
+	UpdateTime                string             `json:"update_time"`
+}
+
+func subscriptionBalance(ctx context.Context, apiURL string, jwt string) (*SubscriptionBalanceResult, error) {
+	strategy := connect.NewClientStrategyWithDefaults(ctx)
+
+	return connect.HttpGetWithStrategy(
+		ctx,
+		strategy,
+		fmt.Sprintf("%s/subscription/balance", apiURL),
+		jwt,
+		&SubscriptionBalanceResult{},
+		connect.NewNoopApiCallback[*SubscriptionBalanceResult](),
+	)
+}
+
+type RefreshJwtResultError struct {
+	Message string `json:"message"`
+}
+
+type RefreshJwtResult struct {
+	ByJwt string                 `json:"by_jwt,omitempty"`
+	Error *RefreshJwtResultError `json:"error,omitempty"`
+}
+
+func refreshJwt(ctx context.Context, apiURL string, jwt string) (*RefreshJwtResult, error) {
+	strategy := connect.NewClientStrategyWithDefaults(ctx)
+
+	return connect.HttpGetWithStrategy(
+		ctx,
+		strategy,
+		fmt.Sprintf("%s/auth/refresh", apiURL),
+		jwt,
+		&RefreshJwtResult{},
+		connect.NewNoopApiCallback[*RefreshJwtResult](),
+	)
 
 }
 
